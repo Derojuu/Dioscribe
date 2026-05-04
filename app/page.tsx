@@ -488,19 +488,19 @@ function buildDocxHtml(result: AnalysisResponse): string {
   const r = result.report;
 
   const h1 = (text: string) =>
-    `<h1 style="font-family:Calibri,sans-serif;font-size:26pt;font-weight:bold;color:#1e3a5f;margin-bottom:4pt;margin-top:0;">${escapeHtml(text)}</h1>`;
+    `<h1 style="font-family:Calibri,sans-serif;font-size:26pt;font-weight:bold;color:#000000;margin-bottom:4pt;margin-top:0;">${escapeHtml(text)}</h1>`;
 
   const h2 = (text: string) =>
-    `<h2 style="font-family:Calibri,sans-serif;font-size:14pt;font-weight:bold;color:#1e3a5f;margin-top:18pt;margin-bottom:4pt;border-bottom:1pt solid #c7d4e0;padding-bottom:3pt;">${escapeHtml(text)}</h2>`;
+    `<h2 style="font-family:Calibri,sans-serif;font-size:14pt;font-weight:bold;color:#000000;margin-top:18pt;margin-bottom:4pt;padding-bottom:3pt;">${escapeHtml(text)}</h2>`;
 
   const p = (text: string) =>
-    `<p style="font-family:Calibri,sans-serif;font-size:11pt;line-height:1.6;color:#1a1a1a;margin:6pt 0;">${escapeHtml(text)}</p>`;
+    `<p style="font-family:Calibri,sans-serif;font-size:11pt;line-height:1.6;color:#000000;margin:6pt 0;">${escapeHtml(text)}</p>`;
 
   const meta = (text: string) =>
-    `<p style="font-family:Calibri,sans-serif;font-size:10pt;color:#555;margin:2pt 0;">${escapeHtml(text)}</p>`;
+    `<p style="font-family:Calibri,sans-serif;font-size:10pt;color:#000000;margin:2pt 0;">${escapeHtml(text)}</p>`;
 
   const li = (text: string) =>
-    `<li style="font-family:Calibri,sans-serif;font-size:11pt;line-height:1.6;color:#1a1a1a;margin:4pt 0;">${escapeHtml(text)}</li>`;
+    `<li style="font-family:Calibri,sans-serif;font-size:11pt;line-height:1.6;color:#000000;margin:4pt 0;">${escapeHtml(text)}</li>`;
 
   const ul = (items: string[]) =>
     items.length
@@ -508,10 +508,10 @@ function buildDocxHtml(result: AnalysisResponse): string {
       : p("None.");
 
   const quote = (text: string) =>
-    `<p style="font-family:Calibri,sans-serif;font-size:11pt;font-style:italic;color:#333;border-left:3pt solid #1e3a5f;padding-left:10pt;margin:8pt 0;">&ldquo;${escapeHtml(text)}&rdquo;</p>`;
+    `<p style="font-family:Calibri,sans-serif;font-size:11pt;font-style:italic;color:#000000;margin:8pt 0;">&ldquo;${escapeHtml(text)}&rdquo;</p>`;
 
   const pre = (text: string) =>
-    `<pre style="font-family:'Courier New',monospace;font-size:10pt;line-height:1.6;color:#1a1a1a;white-space:pre-wrap;word-wrap:break-word;margin:6pt 0;">${escapeHtml(text)}</pre>`;
+    `<pre style="font-family:'Courier New',monospace;font-size:10pt;line-height:1.6;color:#000000;white-space:pre-wrap;word-wrap:break-word;margin:6pt 0;">${escapeHtml(text)}</pre>`;
 
   const sections: string[] = [];
 
@@ -561,10 +561,6 @@ function buildDocxHtml(result: AnalysisResponse): string {
     sections.push(ul(r.confidenceNotes));
   }
 
-  // Transcript
-  sections.push(h2("Transcript"));
-  sections.push(pre(result.transcript));
-
   return `
 <html xmlns:o="urn:schemas-microsoft-com:office:office"
       xmlns:w="urn:schemas-microsoft-com:office:word"
@@ -585,7 +581,7 @@ function buildDocxHtml(result: AnalysisResponse): string {
   <![endif]-->
   <style>
     @page { margin: 2.54cm; }
-    body { font-family: Calibri, sans-serif; font-size: 11pt; }
+    body { font-family: Calibri, sans-serif; font-size: 11pt; color: #000000; }
   </style>
 </head>
 <body>
@@ -731,6 +727,7 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [error, setError] = useState<string>("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<string>("");
   const [result, setResult] = useState<AnalysisResponse | null>(null);
   const [activeTab, setActiveTab] = useState<"report" | "transcript">("report");
   const [restoredFromStorage, setRestoredFromStorage] = useState(false);
@@ -796,6 +793,7 @@ export default function Home() {
     formData.append("file", file);
 
     setIsSubmitting(true);
+    setUploadStatus("Uploading and analysing...");
 
     try {
       const response = await fetch("/api/analyze", {
@@ -803,16 +801,14 @@ export default function Home() {
         body: formData,
       });
 
-      const payload = (await response.json()) as
-        | AnalysisResponse
-        | { error?: string };
+      const payload = (await response.json()) as AnalysisResponse | { error?: string };
 
       if (!response.ok) {
-        const message =
+        throw new Error(
           "error" in payload
-            ? payload.error ?? "The analysis request failed."
-            : "The analysis request failed.";
-        throw new Error(message);
+            ? (payload.error ?? "The analysis request failed.")
+            : "The analysis request failed.",
+        );
       }
 
       setResult(payload as AnalysisResponse);
@@ -824,6 +820,7 @@ export default function Home() {
       );
     } finally {
       setIsSubmitting(false);
+      setUploadStatus("");
     }
   }
 
@@ -903,7 +900,7 @@ export default function Home() {
                 disabled={!file || isSubmitting}
                 className="mt-4 inline-flex min-h-11 w-full items-center justify-center rounded-xl bg-sky-600 px-5 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:bg-slate-300"
               >
-                {isSubmitting ? "Generating report..." : "Transcribe & generate report"}
+                {isSubmitting ? (uploadStatus || "Generating report...") : "Transcribe & generate report"}
               </button>
             </form>
 

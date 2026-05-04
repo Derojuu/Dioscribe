@@ -1,5 +1,9 @@
+import https from "node:https";
+import { IncomingMessage } from "node:http";
+
 const geminiBaseUrl = "https://generativelanguage.googleapis.com/v1beta";
-const geminiUploadUrl = "https://generativelanguage.googleapis.com/upload/v1beta/files";
+const geminiUploadUrl =
+  "https://generativelanguage.googleapis.com/upload/v1beta/files";
 const maxFileSize = 80 * 1024 * 1024;
 const transcriptionModel = "gemini-2.5-flash";
 const reportModel = "gemini-2.5-flash";
@@ -25,31 +29,100 @@ type UploadedFile = {
   name: string;
   uri: string;
   mimeType: string;
-  state?: {
-    name?: string;
-  };
 };
 
 type GenerateContentResponse = {
   candidates?: Array<{
-    content?: {
-      parts?: Array<{
-        text?: string;
-      }>;
-    };
+    content?: { parts?: Array<{ text?: string }> };
     finishReason?: string;
   }>;
-  promptFeedback?: {
-    blockReason?: string;
-  };
-  error?: {
-    message?: string;
-  };
+  promptFeedback?: { blockReason?: string };
+  error?: { message?: string };
 };
 
 function json(data: unknown, init?: ResponseInit) {
   return Response.json(data, init);
 }
+
+// ---------------------------------------------------------------------------
+// Low-level HTTPS helper — bypasses Node's global fetch (and undici timeouts)
+// ---------------------------------------------------------------------------
+
+interface HttpsResponse {
+  status: number;
+  headers: Record<string, string | string[] | undefined>;
+  body: Buffer;
+}
+
+function httpsRequest(
+  url: string,
+  options: {
+    method: string;
+    headers?: Record<string, string>;
+    body?: Buffer | Uint8Array | string;
+  },
+): Promise<HttpsResponse> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const req = https.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port || 443,
+        path: parsed.pathname + parsed.search,
+        method: options.method,
+        headers: options.headers ?? {},
+        // No timeout — let Gemini take as long as it needs
+      },
+      (res: IncomingMessage) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers as Record<string, string | string[] | undefined>,
+            body: Buffer.concat(chunks),
+          });
+        });
+        res.on("error", reject);
+      },
+    );
+
+    req.on("error", reject);
+
+    if (options.body) {
+      req.write(options.body);
+    }
+    req.end();
+  });
+}
+
+async function httpsJson<T>(
+  url: string,
+  options: {
+    method: string;
+    headers?: Record<string, string>;
+    body?: unknown;
+  },
+): Promise<{ status: number; data: T; headers: Record<string, string | string[] | undefined> }> {
+  const bodyBuf = options.body
+    ? Buffer.from(JSON.stringify(options.body), "utf8")
+    : undefined;
+
+  const res = await httpsRequest(url, {
+    method: options.method,
+    headers: {
+      ...(options.headers ?? {}),
+      ...(bodyBuf ? { "Content-Type": "application/json", "Content-Length": String(bodyBuf.length) } : {}),
+    },
+    body: bodyBuf,
+  });
+
+  const text = res.body.toString("utf8").trim();
+  const data = text ? (JSON.parse(text) as T) : ({} as T);
+  return { status: res.status, data, headers: res.headers };
+}
+
+// ---------------------------------------------------------------------------
 
 function createReportSchema() {
   return {
@@ -79,111 +152,85 @@ function createReportSchema() {
           required: ["name", "roleOrContext"],
         },
       },
-      notableQuotes: {
-        type: "array",
-        items: { type: "string" },
-      },
-      confidenceNotes: {
-        type: "array",
-        items: { type: "string" },
-      },
+      notableQuotes: { type: "array", items: { type: "string" } },
+      confidenceNotes: { type: "array", items: { type: "string" } },
     },
     required: [
-      "title",
-      "topic",
-      "preparedDate",
-      "language",
-      "durationSeconds",
-      "preamble",
-      "termsOfReference",
-      "chairpersonOpeningRemarks",
-      "submissions",
-      "observations",
-      "recommendations",
-      "participants",
-      "notableQuotes",
-      "confidenceNotes",
+      "title", "topic", "preparedDate", "language", "durationSeconds",
+      "preamble", "termsOfReference", "chairpersonOpeningRemarks",
+      "submissions", "observations", "recommendations", "participants",
+      "notableQuotes", "confidenceNotes",
     ],
   };
 }
 
-async function readGeminiError(response: Response) {
-  try {
-    const payload = (await response.json()) as {
-      error?: { message?: string };
-    };
-
-    return payload.error?.message ?? "Gemini request failed.";
-  } catch {
-    return "Gemini request failed.";
-  }
+function geminiErrorMessage(data: unknown): string {
+  const d = data as { error?: { message?: string } };
+  return d?.error?.message ?? "Gemini request failed.";
 }
 
-function extractText(payload: GenerateContentResponse) {
+function extractText(payload: GenerateContentResponse): string {
   const text = payload.candidates
-    ?.flatMap((candidate) => candidate.content?.parts ?? [])
-    .map((part) => part.text ?? "")
+    ?.flatMap((c) => c.content?.parts ?? [])
+    .map((p) => p.text ?? "")
     .join("")
     .trim();
 
-  if (text) {
-    return text;
-  }
+  if (text) return text;
 
   const blockReason = payload.promptFeedback?.blockReason;
-  if (blockReason) {
-    throw new Error(`Gemini blocked this request: ${blockReason}.`);
-  }
+  if (blockReason) throw new Error(`Gemini blocked this request: ${blockReason}.`);
 
   const finishReason = payload.candidates?.[0]?.finishReason;
   if (finishReason && finishReason !== "STOP") {
-    throw new Error(`Gemini stopped early with reason: ${finishReason}.`);
+    throw new Error(`Gemini stopped early: ${finishReason}.`);
   }
 
   throw new Error("Gemini returned an empty response.");
 }
 
-async function uploadFile(file: File, apiKey: string) {
-  const startResponse = await fetch(`${geminiUploadUrl}?key=${apiKey}`, {
-    method: "POST",
-    headers: {
-      "X-Goog-Upload-Protocol": "resumable",
-      "X-Goog-Upload-Command": "start",
-      "X-Goog-Upload-Header-Content-Length": String(file.size),
-      "X-Goog-Upload-Header-Content-Type": file.type || "application/octet-stream",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      file: {
-        display_name: file.name,
+async function uploadFile(file: File, apiKey: string): Promise<UploadedFile> {
+  // Step 1: Start resumable upload session
+  const startRes = await httpsJson<unknown>(
+    `${geminiUploadUrl}?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: {
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": String(file.size),
+        "X-Goog-Upload-Header-Content-Type": file.type || "application/octet-stream",
       },
-    }),
-  });
+      body: { file: { display_name: file.name } },
+    },
+  );
 
-  if (!startResponse.ok) {
-    throw new Error(await readGeminiError(startResponse));
+  if (startRes.status >= 300) {
+    throw new Error(geminiErrorMessage(startRes.data));
   }
 
-  const uploadSessionUrl = startResponse.headers.get("x-goog-upload-url");
-  if (!uploadSessionUrl) {
-    throw new Error("Gemini did not return an upload URL.");
-  }
+  const uploadUrl = startRes.headers["x-goog-upload-url"] as string | undefined;
+  if (!uploadUrl) throw new Error("Gemini did not return an upload URL.");
 
-  const uploadResponse = await fetch(uploadSessionUrl, {
+  // Step 2: Upload the file bytes
+  const fileBuffer = Buffer.from(await file.arrayBuffer());
+  const uploadRes = await httpsRequest(uploadUrl, {
     method: "POST",
     headers: {
-      "Content-Length": String(file.size),
+      "Content-Length": String(fileBuffer.length),
+      "Content-Type": file.type || "application/octet-stream",
       "X-Goog-Upload-Offset": "0",
       "X-Goog-Upload-Command": "upload, finalize",
     },
-    body: new Uint8Array(await file.arrayBuffer()),
+    body: fileBuffer,
   });
 
-  if (!uploadResponse.ok) {
-    throw new Error(await readGeminiError(uploadResponse));
+  if (uploadRes.status >= 300) {
+    const errData = JSON.parse(uploadRes.body.toString("utf8")) as unknown;
+    throw new Error(geminiErrorMessage(errData));
   }
 
-  const payload = (await uploadResponse.json()) as { file?: UploadedFile };
+  const payload = JSON.parse(uploadRes.body.toString("utf8")) as { file?: UploadedFile };
   if (!payload.file?.uri || !payload.file?.name) {
     throw new Error("Gemini file upload completed without a usable file reference.");
   }
@@ -192,117 +239,113 @@ async function uploadFile(file: File, apiKey: string) {
 }
 
 async function deleteUploadedFile(fileName: string, apiKey: string) {
-  await fetch(`${geminiBaseUrl}/${fileName}?key=${apiKey}`, {
-    method: "DELETE",
-  });
+  try {
+    await httpsRequest(`${geminiBaseUrl}/${fileName}?key=${apiKey}`, { method: "DELETE" });
+  } catch {
+    // best effort
+  }
 }
 
-async function generateTranscript(uploadedFile: UploadedFile, apiKey: string) {
-  const response = await fetch(
+async function waitForFileActive(fileName: string, apiKey: string): Promise<void> {
+  const maxAttempts = 20;
+  const delayMs = 3000;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const res = await httpsJson<{ state?: string }>(
+      `${geminiBaseUrl}/${fileName}?key=${apiKey}`,
+      { method: "GET" },
+    );
+    if (res.status >= 300) return; // best effort
+
+    if (res.data.state === "ACTIVE") return;
+    if (res.data.state === "FAILED") {
+      throw new Error("Gemini rejected the uploaded file during processing.");
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+}
+
+async function generateTranscript(file: UploadedFile, apiKey: string): Promise<string> {
+  const res = await httpsJson<GenerateContentResponse>(
     `${geminiBaseUrl}/models/${transcriptionModel}:generateContent?key=${apiKey}`,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
+      body: {
+        contents: [{
+          parts: [
+            { file_data: { mime_type: file.mimeType, file_uri: file.uri } },
+            {
+              text: [
+                "Generate a transcript of the speech in this audio.",
+                "Preserve speaker changes when they are clear.",
+                "Add timestamps only when the timing is obvious from the audio.",
+                "If speech is unclear, mark the uncertainty plainly instead of guessing.",
+              ].join(" "),
+            },
+          ],
+        }],
       },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              {
-                file_data: {
-                  mime_type: uploadedFile.mimeType,
-                  file_uri: uploadedFile.uri,
-                },
-              },
-              {
-                text: [
-                  "Generate a transcript of the speech in this audio.",
-                  "Preserve speaker changes when they are clear.",
-                  "Add timestamps only when the timing is obvious from the audio.",
-                  "If speech is unclear, mark the uncertainty plainly instead of guessing.",
-                ].join(" "),
-              },
-            ],
-          },
-        ],
-      }),
     },
   );
 
-  if (!response.ok) {
-    throw new Error(await readGeminiError(response));
-  }
-
-  return extractText((await response.json()) as GenerateContentResponse);
+  if (res.status >= 300) throw new Error(geminiErrorMessage(res.data));
+  return extractText(res.data);
 }
 
 async function generateReport(
-  uploadedFile: UploadedFile,
+  file: UploadedFile,
   transcript: string,
   fileName: string,
   apiKey: string,
-) {
-  const response = await fetch(
+): Promise<AudioReport> {
+  const res = await httpsJson<GenerateContentResponse>(
     `${geminiBaseUrl}/models/${reportModel}:generateContent?key=${apiKey}`,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              {
-                file_data: {
-                  mime_type: uploadedFile.mimeType,
-                  file_uri: uploadedFile.uri,
-                },
-              },
-              {
-                text: [
-                  "You are a professional secretary/rapporteur writing a formal meeting-style report from an audio recording.",
-                  "The format must be consistent and general-purpose (do not over-tailor to one specific organization).",
-                  "Write in clear, professional English that can be shared with colleagues.",
-                  "",
-                  "Rules:",
-                  "- title: A clear, descriptive report title.",
-                  "- topic: Short topic line (what the meeting/audio is broadly about).",
-                  "- preparedDate: Use ISO date format YYYY-MM-DD.",
-                  "- language: The spoken language (best effort).",
-                  "- durationSeconds: Duration in seconds as a number (best effort).",
-                  "- preamble: 3–8 sentences describing the meeting/audio background, purpose, and scope (general, professional).",
-                  "- termsOfReference: Bullet list of what this report covers / mandate / scope. If unclear, provide a reasonable generic scope based on the audio (do not invent facts).",
-                  "- chairpersonOpeningRemarks: 2–6 sentences capturing opening remarks or a generic opening statement if none is explicit (clearly phrase it as 'The chairperson opened by noting…' without adding new facts).",
-                  "- participants: Identify participants when possible. If names are not clear, use labels like 'Speaker 1'. roleOrContext should be short and helpful.",
-                  "- submissions: Bullet list of key submissions/inputs made by parties (e.g., departments, commissions, stakeholders). If none are clear, return [].",
-                  "- observations: Bullet list of factual observations from the discussion (what was noted/observed). If none, return [].",
-                  "- recommendations: Bullet list of recommendations. If none are explicit, provide 3–7 neutral, general recommendations grounded in what was discussed (avoid inventing specifics).",
-                  "- notableQuotes: Exact or near-exact quotes that matter (keep short). If none, return [].",
-                  "- confidenceNotes: Caveats about audio quality, missing context, or unclear speech. If none, include ['No major transcription concerns noted.'].",
-                  "",
-                  "Do not invent facts not supported by the audio or transcript.",
-                  `File name: ${fileName}`,
-                  `Transcript:\n${transcript}`,
-                ].join("\n"),
-              },
-            ],
-          },
-        ],
+      body: {
+        contents: [{
+          parts: [
+            { file_data: { mime_type: file.mimeType, file_uri: file.uri } },
+            {
+              text: [
+                "You are a professional secretary/rapporteur writing a formal meeting-style report from an audio recording.",
+                "The format must be consistent and general-purpose.",
+                "Write in clear, professional English that can be shared with colleagues.",
+                "",
+                "Rules:",
+                "- title: A clear, descriptive report title.",
+                "- topic: Short topic line (what the meeting/audio is broadly about).",
+                "- preparedDate: Use ISO date format YYYY-MM-DD.",
+                "- language: The spoken language (best effort).",
+                "- durationSeconds: Duration in seconds as a number (best effort).",
+                "- preamble: 3–8 sentences describing the meeting/audio background, purpose, and scope.",
+                "- termsOfReference: Bullet list of what this report covers / mandate / scope.",
+                "- chairpersonOpeningRemarks: 2–6 sentences capturing opening remarks.",
+                "- participants: Identify participants when possible. If names are not clear, use labels like 'Speaker 1'.",
+                "- submissions: Bullet list of key submissions/inputs made by parties. If none, return [].",
+                "- observations: Bullet list of factual observations from the discussion. If none, return [].",
+                "- recommendations: Bullet list of recommendations grounded in what was discussed.",
+                "- notableQuotes: Exact or near-exact quotes that matter. If none, return [].",
+                "- confidenceNotes: Caveats about audio quality or unclear speech. If none, include ['No major transcription concerns noted.'].",
+                "",
+                "Do not invent facts not supported by the audio or transcript.",
+                `File name: ${fileName}`,
+                `Transcript:\n${transcript}`,
+              ].join("\n"),
+            },
+          ],
+        }],
         generationConfig: {
           responseMimeType: "application/json",
           responseJsonSchema: createReportSchema(),
         },
-      }),
+      },
     },
   );
 
-  if (!response.ok) {
-    throw new Error(await readGeminiError(response));
-  }
-
-  const text = extractText((await response.json()) as GenerateContentResponse);
+  if (res.status >= 300) throw new Error(geminiErrorMessage(res.data));
+  const text = extractText(res.data);
   return JSON.parse(text) as AudioReport;
 }
 
@@ -311,10 +354,7 @@ export async function POST(request: Request) {
 
   if (!apiKey) {
     return json(
-      {
-        error:
-          "Missing GEMINI_API_KEY or GOOGLE_API_KEY. Add one to .env.local before using the app.",
-      },
+      { error: "Missing GEMINI_API_KEY or GOOGLE_API_KEY. Add one to .env.local." },
       { status: 500 },
     );
   }
@@ -328,9 +368,7 @@ export async function POST(request: Request) {
 
   if (file.size > maxFileSize) {
     return json(
-      {
-        error: "This file is larger than 80 MB. Try a shorter clip or compress it first.",
-      },
+      { error: "This file is larger than 80 MB. Try a shorter clip or compress it first." },
       { status: 400 },
     );
   }
@@ -339,23 +377,15 @@ export async function POST(request: Request) {
 
   try {
     uploadedFile = await uploadFile(file, apiKey);
+    await waitForFileActive(uploadedFile.name, apiKey);
     const transcript = await generateTranscript(uploadedFile, apiKey);
     const report = await generateReport(uploadedFile, transcript, file.name, apiKey);
-
-    return json({
-      transcript,
-      report,
-    });
+    return json({ transcript, report });
   } catch (error) {
-    return json(
-      {
-        error:
-          error instanceof Error
-            ? error.message
-            : "The server could not analyze this audio.",
-      },
-      { status: 500 },
-    );
+    const message =
+      error instanceof Error ? error.message : "The server could not analyze this audio.";
+    console.error("[analyze] error:", error);
+    return json({ error: message }, { status: 500 });
   } finally {
     if (uploadedFile?.name) {
       void deleteUploadedFile(uploadedFile.name, apiKey);
