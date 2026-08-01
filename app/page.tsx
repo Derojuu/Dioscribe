@@ -92,7 +92,7 @@ const allowedTypes = [
   "audio/mpeg3",
 ];
 
-const maxFileSize = 80 * 1024 * 1024;
+const maxFileSize = 90 * 1024 * 1024;
 const waveformBars = [16, 28, 20, 34, 22, 40, 24, 36, 18, 30, 22, 26, 20, 32];
 
 function formatSeconds(totalSeconds: number) {

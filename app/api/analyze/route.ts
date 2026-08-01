@@ -4,7 +4,7 @@ import { IncomingMessage } from "node:http";
 const geminiBaseUrl = "https://generativelanguage.googleapis.com/v1beta";
 const geminiUploadUrl =
   "https://generativelanguage.googleapis.com/upload/v1beta/files";
-const maxFileSize = 80 * 1024 * 1024;
+const maxFileSize = 90 * 1024 * 1024;
 const transcriptionModel = "gemini-2.5-flash";
 const reportModel = "gemini-2.5-flash";
 
